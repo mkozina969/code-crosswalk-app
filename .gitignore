@@ -1,0 +1,11 @@
+# virtual env
+.venv/
+
+# local data & DBs
+data/
+*.db
+*.parquet
+
+# Python caches
+__pycache__/
+*.pyc
