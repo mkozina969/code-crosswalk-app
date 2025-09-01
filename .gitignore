@@ -1,17 +1,2 @@
-# Byte-compiled / caches
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Local venv
-.venv/
-venv/
-
-# OS junk
-.DS_Store
-
-# App artifacts not meant for plain Git
-data/*.db
-data/*.sqlite
-# keep updates.csv (we want to commit queued changes)
-!data/updates.csv
+data/*
+!data/crosswalk.db
