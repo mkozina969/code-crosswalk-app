@@ -1,5 +1,4 @@
-streamlit
-pandas
-openpyxl
-xlsxwriter
-SQLAlchemy==2.0.43   # optional; this app uses sqlite3 directly
+streamlit==1.37.1
+pandas==2.2.2
+openpyxl==3.1.5
+xlsxwriter==3.2.0
