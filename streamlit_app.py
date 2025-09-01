@@ -318,7 +318,111 @@ with st.expander("🔐 Admin • Add / Queue / Apply Mappings", expanded=False):
                     except Exception as e:
                         st.exception(e)
 
- 
+# --- Admin: Live search / inspect mappings ------------------------------------
+def _list_vendors():
+    if not DB_PATH.exists():
+        return []
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT DISTINCT vendor_id FROM crosswalk ORDER BY vendor_id")
+        vals = [r[0] for r in cur.fetchall() if r[0] is not None and str(r[0]).strip() != ""]
+        return vals
+    finally:
+        con.close()
+
+def _search_mappings(vendor_filter: str | None, supplier_q: str, exact: bool):
+    if not DB_PATH.exists():
+        return pd.DataFrame(columns=["vendor_id", "supplier_id", "tow_code"])
+    con = sqlite3.connect(DB_PATH)
+    try:
+        base = "SELECT vendor_id, supplier_id, tow_code FROM crosswalk"
+        clauses = []
+        params = []
+        if vendor_filter and vendor_filter != "ALL":
+            clauses.append("vendor_id = ?")
+            params.append(vendor_filter)
+        if supplier_q:
+            if exact:
+                clauses.append("supplier_id = ?")
+                params.append(supplier_q)
+            else:
+                clauses.append("supplier_id LIKE ?")
+                params.append(f"%{supplier_q}%")
+        if clauses:
+            base += " WHERE " + " AND ".join(clauses)
+        base += " ORDER BY vendor_id, supplier_id LIMIT 500"
+        return pd.read_sql_query(base, con, params=params, dtype=str)
+    finally:
+        con.close()
+
+with st.expander("🔎 Admin • Live search / inspect crosswalk", expanded=False):
+    if "admin_pin_ok" not in st.session_state:
+        st.info("Unlock the Admin section first to use this panel.")
+    else:
+        # small state flag you can set in the admin unlock (below) if you want strict gating
+        pass
+
+    # Vendor picker
+    vendors = _list_vendors()
+    vendor_opt = ["ALL"] + vendors
+    c1, c2, c3 = st.columns([2,2,1])
+    with c1:
+        pick_vendor = st.selectbox("Vendor", vendor_opt, index=0)
+    with c2:
+        supplier_q = st.text_input("supplier_id search", placeholder="exact or contains…")
+    with c3:
+        exact = st.checkbox("Exact", value=True)
+
+    df_res = _search_mappings(pick_vendor, supplier_q.strip(), exact)
+    st.caption(f"{len(df_res)} result(s) shown (max 500)")
+    sel = st.dataframe(
+        df_res,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        height=260,
+    )
+
+    # If user selects a row, prefill the add/upsert controls above via session_state
+    # We’ll store into session keys the Admin form reads (vendor_id / supplier_id / tow_code)
+    if sel and "selection" in sel and sel["selection"].get("rows"):
+        idx = sel["selection"]["rows"][0]
+        row = df_res.iloc[int(idx)]
+        st.info(f"Selected: vendor={row['vendor_id']} • supplier={row['supplier_id']} • tow={row['tow_code']}")
+        # Pre-fill the "Add a single mapping" form (if you want this, set these keys there)
+        st.session_state.setdefault("prefill_vendor_id", row["vendor_id"])
+        st.session_state.setdefault("prefill_supplier_id", row["supplier_id"])
+        st.session_state.setdefault("prefill_tow_code", row["tow_code"])
+        st.caption("Go to the **Add a single mapping** form above — fields are prefilled.")
+
+    st.divider()
+    st.subheader("Bulk queue: upload CSV (tow_code, supplier_id, vendor_id)")
+
+    up_file = st.file_uploader("Upload CSV to queue", type=["csv"], accept_multiple_files=False, key="bulkq")
+    if up_file is not None:
+        try:
+            up_df = pd.read_csv(up_file, dtype=str)
+            required = {"tow_code", "supplier_id", "vendor_id"}
+            if not required.issubset(set(map(str.lower, up_df.columns))):
+                st.error("CSV must contain columns: tow_code, supplier_id, vendor_id")
+            else:
+                # normalize headers (case-insensitive)
+                cols = {c.lower(): c for c in up_df.columns}
+                q = up_df.rename(columns={cols["tow_code"]: "tow_code",
+                                          cols["supplier_id"]: "supplier_id",
+                                          cols["vendor_id"]: "vendor_id"})
+                q = q[["tow_code", "supplier_id", "vendor_id"]].fillna("")
+                cnt = 0
+                for _, r in q.iterrows():
+                    append_pending_csv(str(r["vendor_id"]), str(r["supplier_id"]), str(r["tow_code"]))
+                    cnt += 1
+                st.success(f"Queued {cnt} mapping(s) into updates.csv")
+        except Exception as e:
+            st.exception(e)
+
+
 # 6) Column picker + mapping
 # -----------------------------------------------------------------------------
 st.header("3) Map to TOW")
