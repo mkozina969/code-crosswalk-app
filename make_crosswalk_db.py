@@ -1,228 +1,191 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Build a normalized SQLite crosswalk DB from a CSV exported out of SQL Server.
+Builds/updates a SQLite crosswalk DB from a CSV.
 
-Resulting table schema (always):
-  - tow_code     TEXT   (required)
-  - supplier_id  TEXT   (required; normalized from many possible header names)
-  - vendor_id    TEXT   (optional; if not present it will be NULL)
+Schema:
+  crosswalk(
+      tow_code    TEXT,
+      supplier_id TEXT,
+      vendor_id   TEXT,
+      UNIQUE(vendor_id, supplier_id)
+  )
 
 Usage:
-  python make_crosswalk_db.py --csv crosswalk.csv --db crosswalk.db
-  # Optional chunk size (default 200_000)
-  python make_crosswalk_db.py --csv crosswalk.csv --db crosswalk.db --chunksize 300000
+  python make_crosswalk_db.py --csv crosswalk.csv --db data/crosswalk.db --rebuild
 """
 
 from __future__ import annotations
-
 import argparse
 import csv
-import os
-from pathlib import Path
-import shutil
 import sqlite3
+from pathlib import Path
 from typing import Iterable, Optional
 
 import pandas as pd
 
 
-# -------------------------- helpers -------------------------- #
+# ----------------------------
+# Helpers
+# ----------------------------
 
-def detect_delimiter(csv_path: Path) -> str:
-    """Detect CSV delimiter using csv.Sniffer (fallback to ';' then ',')."""
-    with csv_path.open("rb") as f:
-        sample = f.read(4096)
+def detect_delimiter(path: Path) -> str:
+    """Best-effort delimiter detection; defaults to ';' then ','."""
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        sample = f.read(1024)
     try:
-        dialect = csv.Sniffer().sniff(sample.decode("utf-8", errors="ignore"))
-        if dialect.delimiter in (",", ";", "\t", "|"):
-            print(f"→ Detected delimiter via Sniffer: {repr(dialect.delimiter)}")
-            return dialect.delimiter
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,|\t,")
+        return dialect.delimiter
     except Exception:
-        pass
-
-    # quick heuristic: pick the one that appears more often in the header line
-    header = sample.splitlines()[0].decode("utf-8", errors="ignore")
-    semi = header.count(";")
-    comma = header.count(",")
-    if semi >= comma:
-        print("→ Fallback delimiter chosen: ';'")
-        return ";"
-    print("→ Fallback delimiter chosen: ','")
-    return ","
+        # If we see more ';' than ',', prefer ';'
+        return ";" if sample.count(";") >= sample.count(",") else ","
 
 
-def norm_header(s: str) -> str:
-    """Normalize a column header for matching."""
-    return (
-        s.strip()
-         .lower()
-         .replace("š", "s").replace("č", "c").replace("ć", "c")
-         .replace("đ", "d").replace("ž", "z")
-         .replace(" ", "_")
-         .replace("-", "_")
-         .replace(".", "_")
-         .replace("__", "_")
-    )
+def normalize_col(name: str) -> str:
+    """Lowercase, remove spaces/underscores to compare reliably."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
-# Accept many possible header variants the user might export from SQL/Excel
-TOW_ALIASES: tuple[str, ...] = (
-    "tow", "tow_code", "towkod", "tow_kod", "tow_kod_as_tow", "tow_kod_as_towkod"
-)
-
-SUPPLIER_ALIASES: tuple[str, ...] = (
-    "supplier_id", "supplier", "supplier_code", "suppliercode", "sup_code",
-    "suppler_code", "supplerid",
-    "vendor_code", "vendor code", "vendor",  # some users export vendor code as supplier code
-    "sifra", "sifra_proizvoda", "sifra_ean", "sifra_ean13"  # if you ever remap from these
-)
-
-VENDOR_ALIASES: tuple[str, ...] = (
-    "vendor_id", "vendor", "vendor_navi", "vendor_navi_id", "vendornavi", "vendorid",
-    "vendor__id", "vendor_id_", "ven_id"
-)
+# candidate sets we’ll try to map from
+TOW_CANDIDATES = {
+    "tow", "towcode", "towkod", "tow_kod", "tow_code", "towkod", "towkod",
+}
+SUPPLIER_CANDIDATES = {
+    "supplierid", "supplier_id", "suppliercode", "supplier_code",
+    "supplier", "sifra", "sifraean", "ean", "šifra", "šifrea n", "sifraean",
+}
+VENDOR_CANDIDATES = {
+    "vendorid", "vendor_id", "vendor", "vendornavi", "vendornav", "vendorcode",
+    "dob", "dobvendor",  # allow your DOB000025 style labels
+}
 
 
-def pick_first(cols: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
-    """Return the first column from cols that matches any candidate."""
-    cols_norm = {norm_header(c): c for c in cols}
-    for cand in candidates:
-        key = norm_header(cand)
-        if key in cols_norm:
-            return cols_norm[key]
-        # also allow exact candidate present already normalized
-        if cand in cols_norm:
-            return cols_norm[cand]
+def pick_column(cols: Iterable[str], candidates: set[str]) -> Optional[str]:
+    norm = {normalize_col(c): c for c in cols}
+    for key in candidates:
+        if key in norm:
+            return norm[key]
     return None
 
 
-def clean_string_series(s: pd.Series) -> pd.Series:
-    """Return string series upper-stripped w/o surrounding quotes."""
-    s = s.astype("string", errors="ignore")
-    s = s.fillna("").astype(str).str.strip().str.strip('"').str.strip("'")
-    # don't force upper for numeric-like strings; we keep original but remove spaces
-    return s
-
-
-# -------------------------- core build -------------------------- #
-
-def build_sqlite(csv_path: Path, db_path: Path, chunksize: int = 200_000) -> None:
-    """(Re)build the crosswalk SQLite DB from a CSV."""
-    if db_path.exists():
-        print(f"🧹 Removing existing DB: {db_path}")
-        db_path.unlink()
-
-    sep = detect_delimiter(csv_path)
-    print(f"📥 Reading CSV in chunks (sep={repr(sep)}, chunksize={chunksize:,}) …")
-
-    # Open DB and create table
-    con = sqlite3.connect(str(db_path))
+def ensure_schema(con: sqlite3.Connection, rebuild: bool = False) -> None:
     cur = con.cursor()
-    cur.execute("DROP TABLE IF EXISTS crosswalk")
+    if rebuild:
+        cur.execute("DROP TABLE IF EXISTS crosswalk")
+
+    # Create table (no NOT NULL so vendor_id can be blank if needed)
     cur.execute(
         """
-        CREATE TABLE crosswalk (
-            tow_code     TEXT,
-            supplier_id  TEXT,
-            vendor_id    TEXT
+        CREATE TABLE IF NOT EXISTS crosswalk (
+            tow_code    TEXT,
+            supplier_id TEXT,
+            vendor_id   TEXT
         )
         """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_crosswalk_tow ON crosswalk(tow_code)")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_crosswalk_supplier ON crosswalk(supplier_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_crosswalk_vendor ON crosswalk(vendor_id)")
+    # Enforce upsert target
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_crosswalk_vendor_supplier "
+        "ON crosswalk(vendor_id, supplier_id)"
+    )
     con.commit()
 
-    # Chunked load
-    total_rows = 0
+
+UPSERT_SQL = """
+INSERT INTO crosswalk (tow_code, supplier_id, vendor_id)
+VALUES (?, ?, ?)
+ON CONFLICT(vendor_id, supplier_id) DO UPDATE
+SET tow_code = excluded.tow_code
+"""
+
+
+def clean_cell(v) -> str:
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+def build_sqlite(csv_path: Path, db_path: Path, chunksize: int) -> None:
+    delimiter = detect_delimiter(csv_path)
+    print(f"→ Detected delimiter: {repr(delimiter)}")
+
+    con = sqlite3.connect(str(db_path))
+    cur = con.cursor()
+
+    # Stream the CSV to handle very large files
     chunk_iter = pd.read_csv(
         csv_path,
-        sep=sep,
-        dtype=str,
-        header=0,
-        keep_default_na=False,
-        na_filter=False,
-        chunksize=chunksize,
-        on_bad_lines="skip",
-        encoding="utf-8",
         engine="python",
+        sep=delimiter,
+        chunksize=chunksize,
+        dtype=str,
     )
 
-    for i, df in enumerate(chunk_iter, start=1):
-        # Normalize headers
-        cols_map = {c: norm_header(c) for c in df.columns}
-        df.rename(columns=cols_map, inplace=True)
+    total = 0
+    for ix, chunk in enumerate(chunk_iter, start=1):
+        # map columns
+        cols = list(chunk.columns)
+        tow_col = pick_column(cols, TOW_CANDIDATES)
+        sup_col = pick_column(cols, SUPPLIER_CANDIDATES)
+        ven_col = pick_column(cols, VENDOR_CANDIDATES)
 
-        tow_col = pick_first(df.columns, TOW_ALIASES)
-        sup_col = pick_first(df.columns, SUPPLIER_ALIASES)
-        ven_col = pick_first(df.columns, VENDOR_ALIASES)
-
-        missing = []
-        if not tow_col:
-            missing.append("TOW (any of: " + ", ".join(TOW_ALIASES) + ")")
-        if not sup_col:
-            missing.append("SUPPLIER_ID (any of: " + ", ".join(SUPPLIER_ALIASES) + ")")
-
-        if missing:
-            con.close()
-            raise ValueError(
-                "Required columns not found in CSV chunk.\nMissing: "
-                + "; ".join(missing)
-                + f"\nColumns in file: {list(df.columns)}"
+        if not tow_col or not sup_col:
+            raise KeyError(
+                f"CSV missing required columns. "
+                f"Need tow & supplier_id. "
+                f"Found columns: {cols}"
             )
+        # vendor_id can be optional; will be ""
+        if ven_col is None:
+            ven_col = None
 
-        # Create normalized columns
-        out = pd.DataFrame({
-            "tow_code":     clean_string_series(df[tow_col]),
-            "supplier_id":  clean_string_series(df[sup_col]),
-            "vendor_id":    clean_string_series(df[ven_col]) if ven_col else "",
-        })
+        # Clean and upsert row-by-row
+        rows = []
+        for _, r in chunk.iterrows():
+            tow = clean_cell(r[tow_col])
+            sup = clean_cell(r[sup_col])
+            ven = clean_cell(r[ven_col]) if ven_col else ""
 
-        # Drop completely empty rows (just in case)
-        out = out[
-            out["tow_code"].astype(str).str.len().gt(0)
-            | out["supplier_id"].astype(str).str.len().gt(0)
-        ]
+            # keep only rows that have required fields
+            if not sup or not tow:
+                continue
 
-        # Append to SQLite
-        out.to_sql("crosswalk", con, if_exists="append", index=False)
-        total_rows += len(out)
-        print(f"  • chunk {i:>4} → inserted {len(out):>8,} rows (cumulative {total_rows:>10,})")
+            rows.append((tow, sup, ven))
 
+        if rows:
+            cur.executemany(UPSERT_SQL, rows)
+            con.commit()
+            total += len(rows)
+            print(f"  · chunk {ix}: upserted {len(rows)} rows (total {total})")
+
+    # Final vacuum to compact DB
+    cur.execute("VACUUM")
     con.commit()
     con.close()
-    print(f"✅ Finished building DB: {db_path}  (rows written: {total_rows:,})")
-
-    # Copy to ./data/crosswalk.db for Streamlit to auto-load
-    data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
-    target = data_dir / "crosswalk.db"
-    shutil.copy2(db_path, target)
-    print(f"📦 Copied DB to {target.resolve()}")
+    print(f"✓ Done. Total upserted rows: {total} into {db_path}")
 
 
-# -------------------------- CLI -------------------------- #
+# ----------------------------
+# CLI
+# ----------------------------
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Build normalized crosswalk SQLite DB")
-    ap.add_argument("--csv", required=True, help="Input CSV file")
-    ap.add_argument("--db", default="crosswalk.db", help="SQLite DB output path")
-    ap.add_argument(
-        "--chunksize", type=int, default=200_000,
-        help="Rows per chunk while reading CSV (default: 200k)"
-    )
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="Input CSV")
+    ap.add_argument("--db", default="data/crosswalk.db", help="SQLite path (default: data/crosswalk.db)")
+    ap.add_argument("--chunksize", type=int, default=100_000, help="Rows per chunk (default: 100k)")
+    ap.add_argument("--rebuild", action="store_true", help="Drop & recreate schema before loading")
     args = ap.parse_args()
 
-    csv_path = Path(args.csv)
+    csv_path = Path(args.csv).resolve()
     db_path = Path(args.db)
 
-    if not csv_path.exists():
-        raise SystemExit(f"CSV not found: {csv_path}")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"🏗  Building SQLite from: {csv_path.resolve()}")
-    build_sqlite(csv_path, db_path, chunksize=args.chunksize)
+    con = sqlite3.connect(str(db_path))
+    ensure_schema(con, rebuild=args.rebuild)
+    con.close()
+
+    build_sqlite(csv_path, db_path, args.chunksize)
 
 
 if __name__ == "__main__":
