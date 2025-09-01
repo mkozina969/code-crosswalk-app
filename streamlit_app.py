@@ -157,6 +157,168 @@ if invoice_file:
         st.caption(f"Rows: {len(invoice_df):,} | Columns: {list(invoice_df.columns)}")
 
 # -----------------------------------------------------------------------------
+# --- Admin panel: add / queue / apply mappings --------------------------------
+import csv, sqlite3, os
+from pathlib import Path
+
+DB_PATH = Path("data/crosswalk.db")
+PENDING_CSV = Path("data/updates.csv")
+
+def _ensure_data_dir():
+    PENDING_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+def _ensure_unique_index(con):
+    cur = con.cursor()
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_crosswalk_vendor_supplier
+        ON crosswalk(vendor_id, supplier_id)
+    """)
+    con.commit()
+
+def upsert_mapping_sqlite(vendor_id: str, supplier_id: str, tow_code: str) -> None:
+    """Insert or update a single mapping into the SQLite DB."""
+    _ensure_data_dir()
+    con = sqlite3.connect(DB_PATH)
+    try:
+        _ensure_unique_index(con)
+        cur = con.cursor()
+        cur.execute("""
+        INSERT INTO crosswalk (tow_code, supplier_id, vendor_id)
+        VALUES (?, ?, ?)
+        ON CONFLICT(vendor_id, supplier_id)
+        DO UPDATE SET tow_code = excluded.tow_code
+        """, (str(tow_code).strip(), str(supplier_id).strip(), str(vendor_id).strip() or None))
+        con.commit()
+    finally:
+        con.close()
+
+def append_pending_csv(vendor_id: str, supplier_id: str, tow_code: str) -> None:
+    """Queue a mapping into data/updates.csv (created if missing)."""
+    _ensure_data_dir()
+    write_header = not PENDING_CSV.exists()
+    with PENDING_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["tow_code", "supplier_id", "vendor_id"])
+        if write_header:
+            w.writeheader()
+        w.writerow({
+            "tow_code": str(tow_code).strip(),
+            "supplier_id": str(supplier_id).strip(),
+            "vendor_id": str(vendor_id).strip()
+        })
+
+def apply_pending_to_sqlite() -> int:
+    """Read data/updates.csv and upsert all rows into the DB. Returns count."""
+    if not PENDING_CSV.exists():
+        return 0
+    con = sqlite3.connect(DB_PATH)
+    try:
+        _ensure_unique_index(con)
+        cur = con.cursor()
+        with PENDING_CSV.open(newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            n = 0
+            for r in rdr:
+                tow = str(r["tow_code"]).strip()
+                sup = str(r["supplier_id"]).strip()
+                ven = str(r.get("vendor_id", "")).strip() or None
+                cur.execute("""
+                INSERT INTO crosswalk (tow_code, supplier_id, vendor_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(vendor_id, supplier_id)
+                DO UPDATE SET tow_code = excluded.tow_code
+                """, (tow, sup, ven))
+                n += 1
+        con.commit()
+        return n
+    finally:
+        con.close()
+
+def load_pending_df():
+    if PENDING_CSV.exists():
+        return pd.read_csv(PENDING_CSV, dtype=str)
+    return pd.DataFrame(columns=["tow_code", "supplier_id", "vendor_id"])
+
+# ------------- Admin UI -------------
+with st.expander("🔐 Admin • Add / Queue / Apply Mappings", expanded=False):
+    # Simple PIN gate (change this!). Preferably put PIN in st.secrets["admin_pin"]
+    default_pin = os.environ.get("ST_ADMIN_PIN", None) or st.secrets.get("admin_pin", "letmein")
+    pin = st.text_input("Admin PIN", type="password", placeholder="Enter PIN to enable admin actions")
+    ok = st.button("Unlock")
+
+    if ok:
+        if pin != default_pin:
+            st.error("Incorrect PIN.")
+        else:
+            st.success("Admin unlocked.")
+            st.caption(f"DB: `{DB_PATH}`  •  Pending CSV: `{PENDING_CSV}`")
+
+            st.subheader("Add a single mapping")
+            with st.form("admin_add_one"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    vendor_id = st.text_input("vendor_id", placeholder="e.g. DOB0000025")
+                with c2:
+                    supplier_id = st.text_input("supplier_id", placeholder="e.g. 0986356023")
+                with c3:
+                    tow_code = st.text_input("tow_code", placeholder="e.g. 200183")
+
+                add_mode = st.radio(
+                    "Add to…",
+                    ["Queue (updates.csv)", "Directly to SQLite (upsert)"],
+                    horizontal=True,
+                )
+                submitted = st.form_submit_button("Add")
+                if submitted:
+                    if not (vendor_id and supplier_id and tow_code):
+                        st.error("All three fields are required.")
+                    else:
+                        # Normalize as TEXT (keep leading zeros)
+                        vendor_id = str(vendor_id).strip()
+                        supplier_id = str(supplier_id).strip()
+                        tow_code = str(tow_code).strip()
+
+                        try:
+                            if add_mode.startswith("Queue"):
+                                append_pending_csv(vendor_id, supplier_id, tow_code)
+                                st.success(f"Queued: {vendor_id} / {supplier_id} → {tow_code}")
+                            else:
+                                upsert_mapping_sqlite(vendor_id, supplier_id, tow_code)
+                                st.success(f"Upserted into DB: {vendor_id} / {supplier_id} → {tow_code}")
+                        except Exception as e:
+                            st.exception(e)
+
+            st.subheader("Queued updates (data/updates.csv)")
+            df_pending = load_pending_df()
+            st.dataframe(df_pending, use_container_width=True, height=220)
+
+            cA, cB, cC = st.columns([1,1,1])
+            with cA:
+                if st.button("Apply queued to SQLite (Upsert)"):
+                    try:
+                        n = apply_pending_to_sqlite()
+                        st.success(f"Applied {n} row(s) to DB.")
+                    except Exception as e:
+                        st.exception(e)
+
+            with cB:
+                if st.download_button(
+                    "Download queued CSV",
+                    data=df_pending.to_csv(index=False).encode("utf-8"),
+                    file_name="updates.csv",
+                    mime="text/csv",
+                    disabled=df_pending.empty,
+                ):
+                    pass
+
+            with cC:
+                if st.button("Clear queued CSV", type="secondary", disabled=df_pending.empty):
+                    try:
+                        PENDING_CSV.unlink(missing_ok=True)
+                        st.info("Cleared data/updates.csv.")
+                    except Exception as e:
+                        st.exception(e)
+
+  -----------------------------------------------------------------------------
 # 6) Column picker + mapping
 # -----------------------------------------------------------------------------
 st.header("3) Map to TOW")
