@@ -8,6 +8,55 @@ from typing import Iterable, Tuple
 import pandas as pd
 import streamlit as st
 
+# --- DB helpers (ADD THIS BLOCK NEAR THE TOP) -------------------------------
+from pathlib import Path
+import sqlite3
+
+DB_PATH = Path("data/crosswalk.db")
+
+def open_db() -> sqlite3.Connection:
+    """
+    Always open the single source of truth DB and guarantee schema + index.
+    Safe to call many times; CREATE IF NOT EXISTS is idempotent.
+    """
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+
+    # Ensure table
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS crosswalk (
+            tow_code    TEXT,
+            supplier_id TEXT,
+            vendor_id   TEXT
+        )
+    """)
+
+    # Ensure UNIQUE index used by ON CONFLICT clause (very important)
+    con.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_crosswalk_vs
+        ON crosswalk(vendor_id, supplier_id)
+    """)
+
+    con.commit()
+    return con
+
+
+def upsert_mapping(con: sqlite3.Connection, vendor_id: str, supplier_id: str, tow_code: str) -> None:
+    """
+    Insert or update mapping for (vendor_id, supplier_id) with tow_code.
+    """
+    con.execute(
+        """
+        INSERT INTO crosswalk(tow_code, supplier_id, vendor_id)
+        VALUES (?, ?, ?)
+        ON CONFLICT(vendor_id, supplier_id)
+        DO UPDATE SET tow_code = excluded.tow_code
+        """,
+        (tow_code, supplier_id, vendor_id),
+    )
+    con.commit()
+# ---------------------------------------------------------------------------
+
 # -----------------------------
 # Paths / constants
 # -----------------------------
