@@ -318,7 +318,7 @@ with st.expander("🔐 Admin • Add / Queue / Apply Mappings", expanded=False):
                     except Exception as e:
                         st.exception(e)
 
-  -----------------------------------------------------------------------------
+ 
 # 6) Column picker + mapping
 # -----------------------------------------------------------------------------
 st.header("3) Map to TOW")
