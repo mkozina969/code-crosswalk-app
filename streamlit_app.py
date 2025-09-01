@@ -19,6 +19,126 @@ from typing import Iterable, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+from __future__ import annotations
+
+import io
+import os
+from pathlib import Path
+import sqlite3
+from typing import Iterable, Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+
+# ---------- BASE DIR (works on local + Streamlit Cloud) ----------
+BASE_DIR = Path(__file__).resolve().parent
+
+DB_PATH = BASE_DIR / "data" / "crosswalk.db"
+CSV_PATH = BASE_DIR / "crosswalk.csv"
+UPDATES_CSV = BASE_DIR / "data" / "updates.csv"
+
+REPO_READONLY_MODE = True
+ADMIN_PIN = os.environ.get("ADMIN_PIN", "0000")
+
+
+def _read_csv_detecting_delimiter(csv_path: Path, chunksize: int = 100_000):
+    """
+    Robust CSV reader that autodetects delimiter (; or ,) and streams chunks.
+    Works with very large files.
+    """
+    # Pandas' engine='python' + sep=None tells it to sniff the delimiter per chunk.
+    return pd.read_csv(
+        csv_path,
+        dtype=str,
+        sep=None,              # <- autodetects delimiter
+        engine="python",       # <- required for sep=None
+        chunksize=chunksize,
+    )
+
+
+def normalize_crosswalk_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize headers + types of the crosswalk CSV/DF.
+    Expected columns: tow_code, supplier_id, vendor_id (case-insensitive allowed).
+    """
+    cols = {c.strip().lower(): c for c in df.columns}
+    def pick(colnames: Iterable[str], fallback: Optional[str] = None) -> Optional[str]:
+        for c in colnames:
+            if c in cols:
+                return cols[c]
+        return fallback
+
+    col_tow  = pick(["tow", "tow_code", "towkod", "tow_kod", "towcode"])
+    col_sup  = pick(["supplier_id", "supplier", "vendor code", "vendor_code", "vendor code "])
+    col_ven  = pick(["vendor_id", "vendor navi", "vendor_navi", "venodr_id", "vendorid"])
+
+    if col_sup is None and "supplier_id" in df.columns: col_sup = "supplier_id"
+    if col_tow is None and "tow_code" in df.columns:   col_tow = "tow_code"
+    if col_ven is None and "vendor_id" in df.columns:  col_ven = "vendor_id"
+
+    rename = {}
+    if col_tow and col_tow != "tow_code":    rename[col_tow] = "tow_code"
+    if col_sup and col_sup != "supplier_id": rename[col_sup] = "supplier_id"
+    if col_ven and col_ven != "vendor_id":   rename[col_ven] = "vendor_id"
+    if rename:
+        df = df.rename(columns=rename)
+
+    for c in ["tow_code", "supplier_id", "vendor_id"]:
+        if c not in df.columns:
+            df[c] = None
+        df[c] = df[c].astype(str).str.strip()
+
+    return df[["tow_code", "supplier_id", "vendor_id"]]
+
+
+def ensure_db_from_csv_if_missing() -> None:
+    """
+    If data/crosswalk.db doesn't exist but crosswalk.csv does, build it.
+    Handles ; or , delimiters.
+    """
+    if DB_PATH.exists() or not CSV_PATH.exists():
+        return
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+
+    first = True
+    for chunk in _read_csv_detecting_delimiter(CSV_PATH, chunksize=100_000):
+        norm = normalize_crosswalk_df(chunk)
+        norm.to_sql("crosswalk", con, if_exists="replace" if first else "append", index=False)
+        first = False
+
+    con.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_crosswalk_vs
+        ON crosswalk(vendor_id, supplier_id)
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def open_db() -> sqlite3.Connection:
+    ensure_db_from_csv_if_missing()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crosswalk (
+            tow_code    TEXT,
+            supplier_id TEXT,
+            vendor_id   TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_crosswalk_vs
+        ON crosswalk(vendor_id, supplier_id)
+        """
+    )
+    con.commit()
+    return con
 
 # --------------------------- Repo layout constants ---------------------------
 DB_PATH = Path("data/crosswalk.db")
