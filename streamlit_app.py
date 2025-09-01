@@ -469,7 +469,7 @@ with st.expander("🔎 Admin • Live search / inspect crosswalk", expanded=Fals
         vendor_opt = ["ALL"] + vendors_list
         c1, c2, c3 = st.columns([2,2,1])
         with c1:
-            pick_vendor = st.selectbox("Vendor", vendor_opt, index=0)
+            pick_vendor = st.selectbox("Vendor", vendor_opt, index=0, key="search_vendor")
         with c2:
             supplier_q = st.text_input("supplier_id search", placeholder="exact or contains…")
         with c3:
