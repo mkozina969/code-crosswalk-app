@@ -2,4 +2,4 @@ streamlit
 pandas
 openpyxl
 xlsxwriter
-pyarrow>=14.0.1
+SQLAlchemy==2.0.43   # optional; this app uses sqlite3 directly
