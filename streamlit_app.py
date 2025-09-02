@@ -572,12 +572,5 @@ with st.expander("🔎 Admin • Live search / inspect crosswalk", expanded=Fals
                     st.session_state["prefill_tow_code"] = str(row.get("tow_code", "") or "")
                     st.success("Prefilled. Scroll up to 'Add a single mapping' in Admin panel.")
          
-         st.subheader("🧰 DB maintenance")
-               uploaded_db = st.file_uploader("Replace data/crosswalk.db (upload a .db file)", type=["db"], key="db_upl")
-               if uploaded_db is not None:
-                  DATA_DIR.mkdir(parents=True, exist_ok=True)
-                  outp = DATA_DIR / "crosswalk.db"
-                  outp.write_bytes(uploaded_db.getvalue())
-                  st.success(f"Replaced DB at {outp}.")
-                  st.info("Click ♻️ Clear cache & re-run (top) to reload the new DB.")
+        
            
