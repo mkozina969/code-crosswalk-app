@@ -31,6 +31,24 @@ def _log(msg: str):
 
 
 # =============================================================================
+from datetime import datetime
+
+st.caption(f"📦 DB path: {DB_PATH.resolve()}")
+if DB_PATH.exists():
+    st.caption(
+        f"🕒 DB modified: {datetime.fromtimestamp(DB_PATH.stat().st_mtime):%Y-%m-%d %H:%M:%S} • "
+        f"size: {DB_PATH.stat().st_size/1_048_576:.2f} MB"
+    )
+    if st.button("Count rows (live from SQLite)"):
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cnt = con.execute("SELECT COUNT(*) FROM crosswalk").fetchone()[0]
+            st.success(f"SQLite says: {cnt:,} rows")
+        finally:
+            con.close()
+else:
+    st.warning("DB not found at expected path; app may be falling back to CSV.")
+
 # Utilities
 # =============================================================================
 def _ensure_data_dir():
@@ -553,3 +571,13 @@ with st.expander("🔎 Admin • Live search / inspect crosswalk", expanded=Fals
                     st.session_state["prefill_supplier_id"] = str(row.get("supplier_id", "") or "")
                     st.session_state["prefill_tow_code"] = str(row.get("tow_code", "") or "")
                     st.success("Prefilled. Scroll up to 'Add a single mapping' in Admin panel.")
+         
+         st.subheader("🧰 DB maintenance")
+uploaded_db = st.file_uploader("Replace data/crosswalk.db (upload a .db file)", type=["db"], key="db_upl")
+if uploaded_db is not None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    outp = DATA_DIR / "crosswalk.db"
+    outp.write_bytes(uploaded_db.getvalue())
+    st.success(f"Replaced DB at {outp}.")
+    st.info("Click ♻️ Clear cache & re-run (top) to reload the new DB.")
+           
