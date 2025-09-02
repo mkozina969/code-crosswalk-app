@@ -1,383 +1,463 @@
+from __future__ import annotations
+
 import os
 import io
+import csv
 import sqlite3
-from typing import List, Tuple
+from pathlib import Path
+from typing import Optional, Tuple, List
 
 import pandas as pd
 import streamlit as st
 
-# ------------------------- BASIC SETTINGS -------------------------
-st.set_page_config(page_title="Crosswalk Mapper", layout="wide")
-ADMIN_PIN = os.getenv("CROSSWALK_ADMIN_PIN", "2468")
-DB_PATH = os.path.join("data", "crosswalk.db")
-CSV_FALLBACK = "crosswalk.csv"  # used if DB is missing (first run only)
+
+# --------------------------
+# Paths & basic config
+# --------------------------
+APP_ROOT = Path(__file__).resolve().parent
+
+# Allow override via env var; otherwise try common locations
+CANDIDATE_DB_PATHS = [
+    os.environ.get("CROSSWALK_DB") or "",
+    APP_ROOT / "data" / "crosswalk.db",
+    APP_ROOT.parent / "data" / "crosswalk.db",
+    Path("data/crosswalk.db"),
+]
+
+UPDATES_CSV = APP_ROOT / "data" / "updates.csv"
+
+st.set_page_config(page_title="Supplier → TOW Mapper (SQLite)", layout="wide")
 
 
-# ------------------------- DB HELPERS -------------------------
-def open_conn() -> sqlite3.Connection:
-    """Open SQLite with sane defaults for Streamlit."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """
-    Ensure crosswalk table + UNIQUE index exist.
-    Table schema is intentionally simple: tow_code, supplier_id, vendor_id (TEXT).
-    """
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS crosswalk (
-            tow_code     TEXT,
-            supplier_id  TEXT,
-            vendor_id    TEXT
-        );
-        """
+# --------------------------
+# DB helpers
+# --------------------------
+def _choose_db_path() -> Path:
+    for p in CANDIDATE_DB_PATHS:
+        if not p:
+            continue
+        p = Path(p)
+        if p.exists():
+            return p
+    # last resort: show where we looked & fail visibly
+    tried = [str(Path(x)) for x in CANDIDATE_DB_PATHS if x]
+    st.error(
+        "Could not locate crosswalk database.\n\n"
+        "Tried: \n- " + "\n- ".join(tried)
     )
-    # Unique index for ON CONFLICT upserts
-    conn.execute(
+    st.stop()
+
+
+@st.cache_resource(show_spinner=False)
+def get_db_path() -> Path:
+    return _choose_db_path()
+
+
+def connect_db() -> sqlite3.Connection:
+    db_path = get_db_path()
+    con = sqlite3.connect(str(db_path), check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    # make sure the unique index exists so upserts never fail
+    ensure_unique_index(con)
+    return con
+
+
+def ensure_unique_index(con: sqlite3.Connection) -> None:
+    # Unique index on (vendor_id, supplier_id) ensures ON CONFLICT works
+    con.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS ux_crosswalk_vs
         ON crosswalk(vendor_id, supplier_id);
         """
     )
-    conn.commit()
+    con.commit()
 
 
-def bootstrap_db_if_missing():
-    """
-    If DB doesn't exist but CSV is present, build a DB from CSV.
-    Only runs on first-time setup.
-    """
-    if not os.path.exists(DB_PATH) and os.path.exists(CSV_FALLBACK):
-        conn = open_conn()
-        ensure_schema(conn)
-
-        chunks = pd.read_csv(CSV_FALLBACK, dtype=str, chunksize=100_000)
-        total = 0
-        for chunk in chunks:
-            chunk = normalize_crosswalk_df(chunk)
-            chunk.to_sql("crosswalk", conn, if_exists="append", index=False)
-            total += len(chunk)
-
-        # Deduplicate using the unique index (will drop true duplicates)
-        conn.execute(
-            """
-            DELETE FROM crosswalk
-            WHERE rowid NOT IN (
-              SELECT MIN(rowid) FROM crosswalk
-              GROUP BY vendor_id, supplier_id
-            );
-            """
-        )
-        conn.commit()
-        conn.close()
-
-
-def normalize_crosswalk_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean incoming crosswalk data to three expected columns:
-    ['tow_code', 'supplier_id', 'vendor_id'] all as strings, no spaces around.
-    Accepts a variety of header spellings; raises if we can’t find what we need.
-    """
-    # Lowercase, strip, unify column names
-    df = df.copy()
-    df.columns = [str(c).strip().lower() for c in df.columns]
-
-    # Candidate columns
-    tow_cols = ["tow", "tow_code", "towcode", "towkod", "tow_kod", "towkod"]
-    sup_cols = ["supplier_id", "supplier", "supplier code", "supplier_code", "sup", "sup_code", "customs code", "customs_code"]
-    ven_cols = ["vendor_id", "vendor", "vendor code", "vendor_code"]
-
-    def pick(cols: List[str]) -> str:
-        for c in cols:
-            if c in df.columns:
-                return c
-        return ""
-
-    tow = pick(tow_cols)
-    sup = pick(sup_cols)
-    ven = pick(ven_cols)  # vendor optional in raw csv, but we prefer to have it
-
-    if not sup:
-        raise ValueError("Could not find SUPPLIER code column in crosswalk CSV.")
-    if not tow:
-        raise ValueError("Could not find TOW code column in crosswalk CSV.")
-    if not ven:
-        ven = "vendor_id"
-        df[ven] = ""  # placeholder if CSV had no vendor info
-
-    out = pd.DataFrame(
-        {
-            "tow_code": df[tow].astype(str).str.strip(),
-            "supplier_id": df[sup].astype(str).str.strip(),
-            "vendor_id": df[ven].astype(str).str.strip(),
-        }
-    )
-    return out
-
-
-def get_vendors(conn: sqlite3.Connection) -> List[str]:
-    vendors = pd.read_sql("SELECT DISTINCT vendor_id FROM crosswalk ORDER BY vendor_id", conn)
-    vals = vendors["vendor_id"].fillna("").tolist()
-    return [v for v in vals if v]  # drop blanks
-
-
-def upsert_mapping(conn: sqlite3.Connection, vendor_id: str, supplier_id: str, tow_code: str) -> Tuple[bool, str]:
-    """
-    Upsert (vendor_id, supplier_id) -> tow_code.
-    Returns (ok, message).
-    """
+@st.cache_data(show_spinner=False)
+def get_db_counts() -> Tuple[int, int]:
+    con = connect_db()
     try:
-        conn.execute(
+        total = con.execute("SELECT COUNT(*) FROM crosswalk").fetchone()[0]
+        vendors = con.execute("SELECT COUNT(DISTINCT vendor_id) FROM crosswalk").fetchone()[0]
+        return total, vendors
+    finally:
+        con.close()
+
+
+@st.cache_data(show_spinner=False)
+def get_vendor_list() -> List[str]:
+    con = connect_db()
+    try:
+        rows = con.execute(
+            "SELECT DISTINCT vendor_id FROM crosswalk ORDER BY vendor_id"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        con.close()
+
+
+def upsert_mapping(vendor_id: str, supplier_id: str, tow_code: str) -> int:
+    con = connect_db()
+    try:
+        cur = con.execute(
             """
             INSERT INTO crosswalk(tow_code, supplier_id, vendor_id)
             VALUES(?, ?, ?)
             ON CONFLICT(vendor_id, supplier_id)
             DO UPDATE SET tow_code = excluded.tow_code;
             """,
-            (tow_code.strip(), supplier_id.strip(), vendor_id.strip()),
+            (tow_code, supplier_id, vendor_id),
         )
-        conn.commit()
-        return True, "Upsert OK."
-    except Exception as e:
-        return False, f"Upsert failed: {e}"
+        con.commit()
+        return cur.rowcount
+    finally:
+        con.close()
 
 
-def live_search(
-    conn: sqlite3.Connection, vendor_id: str, supplier_like: str, tow_like: str, limit: int = 500
+def live_search_crosswalk(
+    vendor: str | None, supplier_contains: str | None, limit: int = 500
 ) -> pd.DataFrame:
-    """
-    Live search over crosswalk with contains filters.
-    """
-    vendor_q = "" if vendor_id == "ALL" else "AND vendor_id = ?"
-    params: List[str] = []
-    sql = f"""
-    SELECT tow_code, supplier_id, vendor_id
-    FROM crosswalk
-    WHERE 1=1
-      {vendor_q}
-    """
-    if vendor_id != "ALL":
-        params.append(vendor_id)
+    con = connect_db()
+    try:
+        if vendor and vendor != "ALL" and supplier_contains:
+            q = """
+                SELECT tow_code, supplier_id, vendor_id
+                FROM crosswalk
+                WHERE vendor_id = ?
+                  AND supplier_id LIKE ?
+                ORDER BY supplier_id
+                LIMIT ?
+            """
+            params = (vendor, f"%{supplier_contains}%", limit)
+        elif vendor and vendor != "ALL":
+            q = """
+                SELECT tow_code, supplier_id, vendor_id
+                FROM crosswalk
+                WHERE vendor_id = ?
+                ORDER BY supplier_id
+                LIMIT ?
+            """
+            params = (vendor, limit)
+        elif supplier_contains:
+            q = """
+                SELECT tow_code, supplier_id, vendor_id
+                FROM crosswalk
+                WHERE supplier_id LIKE ?
+                ORDER BY vendor_id, supplier_id
+                LIMIT ?
+            """
+            params = (f"%{supplier_contains}%", limit)
+        else:
+            q = """
+                SELECT tow_code, supplier_id, vendor_id
+                FROM crosswalk
+                ORDER BY vendor_id, supplier_id
+                LIMIT ?
+            """
+            params = (limit,)
 
-    if supplier_like.strip():
-        sql += " AND supplier_id LIKE ?"
-        params.append(f"%{supplier_like.strip()}%")
-
-    if tow_like.strip():
-        sql += " AND tow_code LIKE ?"
-        params.append(f"%{tow_like.strip()}%")
-
-    sql += " ORDER BY vendor_id, supplier_id LIMIT ?"
-    params.append(limit)
-
-    return pd.read_sql(sql, conn, params=params)
+        df = pd.read_sql_query(q, con, params=params)
+        return df
+    finally:
+        con.close()
 
 
-# ------------------------- UI HELPERS -------------------------
-def banner_ok(db_path: str, rows: int, vendors: int):
-    st.success(
-        f"Database ready at **{db_path}** • rows: **{rows:,}** • vendors: **{vendors}**"
-    )
+@st.cache_data(show_spinner=False)
+def get_vendor_mapping(vendor_id: str) -> pd.DataFrame:
+    """Supplier → TOW mapping for a single vendor."""
+    con = connect_db()
+    try:
+        df = pd.read_sql_query(
+            "SELECT supplier_id, tow_code FROM crosswalk WHERE vendor_id = ?",
+            con,
+            params=(vendor_id,),
+        )
+        return df
+    finally:
+        con.close()
 
 
-def read_invoice(upload) -> pd.DataFrame:
-    """
-    Read user’s invoice (CSV/XLSX) into DataFrame[str].
-    """
-    if upload.name.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(upload, dtype=str)
-    else:
-        # Try CSV with a couple of separators
-        upload.seek(0)
-        raw = upload.read()
-        # guess sep (common: ';' or ',')
-        try:
-            df = pd.read_csv(io.BytesIO(raw), dtype=str, sep=";")
-            if df.shape[1] == 1:  # probably wrong sep
-                df = pd.read_csv(io.BytesIO(raw), dtype=str)
-        except Exception:
-            df = pd.read_csv(io.BytesIO(raw), dtype=str)
-    df = df.fillna("")
+# --------------------------
+# CSV/Excel helpers
+# --------------------------
+def _read_csv_flex(file) -> pd.DataFrame:
+    """Robust CSV reader – tries sep=',' then ';' (common in EU exports)."""
+    file.seek(0)
+    try:
+        df = pd.read_csv(file, dtype=str, engine="python")
+        if df.shape[1] == 1:
+            file.seek(0)
+            df = pd.read_csv(file, dtype=str, sep=";", engine="python")
+    except Exception:
+        file.seek(0)
+        df = pd.read_csv(file, dtype=str, sep=";", engine="python")
+
     return df
 
 
-def guess_supplier_col(cols: List[str]) -> str:
-    low = [c.lower() for c in cols]
+def read_any_table(upload) -> pd.DataFrame:
+    name = (upload.name or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(upload, dtype=str)
+    else:
+        # assume CSV
+        df = _read_csv_flex(upload)
+    return df.convert_dtypes()
+
+
+# --------------------------
+# Queue helpers (CSV)
+# --------------------------
+def queue_append(vendor_id: str, supplier_id: str, tow_code: str) -> None:
+    UPDATES_CSV.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not UPDATES_CSV.exists()
+    with UPDATES_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["vendor_id", "supplier_id", "tow_code"])
+        w.writerow([vendor_id, supplier_id, tow_code])
+
+
+def queue_read() -> pd.DataFrame:
+    if not UPDATES_CSV.exists():
+        return pd.DataFrame(columns=["vendor_id", "supplier_id", "tow_code"])
+    return pd.read_csv(UPDATES_CSV, dtype=str)
+
+
+def queue_clear() -> None:
+    if UPDATES_CSV.exists():
+        UPDATES_CSV.unlink()
+
+
+def queue_apply() -> Tuple[int, int]:
+    """Apply queued updates to SQLite (upsert). Returns (applied, errors)."""
+    df = queue_read()
+    if df.empty:
+        return 0, 0
+    ok = 0
+    bad = 0
+    for _, row in df.iterrows():
+        try:
+            upsert_mapping(
+                vendor_id=str(row["vendor_id"]),
+                supplier_id=str(row["supplier_id"]),
+                tow_code=str(row["tow_code"]),
+            )
+            ok += 1
+        except Exception:
+            bad += 1
+    return ok, bad
+
+
+# --------------------------
+# UI helpers
+# --------------------------
+def banner():
+    db_path = get_db_path()
+    total, vendors = get_db_counts()
+    st.success(
+        f"Database ready at **{db_path}** • rows: **{total:,}** • vendors: **{vendors}**"
+    )
+
+
+def choose_supplier_col(df: pd.DataFrame) -> str:
+    # heuristic: pick probable columns, else let user choose any
     candidates = [
         "supplier_id",
-        "supplier",
-        "supplier code",
+        "supplierid",
         "supplier_code",
-        "sup_code",
-        "customs code",
-        "customs_code",
+        "suppliercode",
+        "supplier_ic",
+        "supplier",
         "code",
+        "id",
     ]
-    for c in candidates:
-        if c in low:
-            return cols[low.index(c)]
-    # fallback: first text-like column
-    return cols[0] if cols else ""
+    cols = list(df.columns)
+    default = 0
+    for i, c in enumerate(cols):
+        if c.strip().lower() in candidates:
+            default = i
+            break
+    col = st.selectbox("Which column contains the SUPPLIER code?", cols, index=default, key="supplier_col_pick")
+    return col
 
 
-def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "data") -> bytes:
-    with io.BytesIO() as buf:
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-            df.to_excel(xw, index=False, sheet_name=sheet_name)
-        return buf.getvalue()
+def table_download_button(df1: pd.DataFrame, df2: pd.DataFrame, label: str):
+    """Download matched + unmatched to a single Excel file."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+        df1.to_excel(xw, index=False, sheet_name="Matched")
+        df2.to_excel(xw, index=False, sheet_name="Unmatched")
+    st.download_button(
+        label=label,
+        data=buf.getvalue(),
+        file_name="mapping_result.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_mapping_result",
+    )
 
 
-# ------------------------- APP -------------------------
+# --------------------------
+# App
+# --------------------------
 def main():
     st.title("Supplier → TOW Mapper (SQLite)")
+    banner()
+    st.divider()
 
-    # Ensure DB exists
-    bootstrap_db_if_missing()
-
-    # Connect + ensure schema/index
-    conn = open_conn()
-    ensure_schema(conn)
-
-    # Quick DB stats
-    rows = pd.read_sql("SELECT COUNT(*) n FROM crosswalk", conn)["n"].iat[0]
-    vlist = get_vendors(conn)
-    banner_ok(DB_PATH, rows, len(vlist))
-
-    st.write("---")
-
-    # 1) Upload invoice
+    # ----------------------
+    # 2) Upload supplier invoice (Excel / CSV)
+    # ----------------------
     st.header("2) Upload supplier invoice (Excel / CSV)")
-    up = st.file_uploader("Drag & drop or Browse", type=["csv", "xlsx", "xls"])
-    invoice_df = None
 
-    if up:
+    upload = st.file_uploader(
+        "Drag & drop or Browse", type=["csv", "xlsx", "xls"], key="uploader"
+    )
+
+    if upload is not None:
         try:
-            invoice_df = read_invoice(up)
+            df = read_any_table(upload)
         except Exception as e:
-            st.error(f"Failed to read file: {e}")
-            return
+            st.error(f"Could not read file: {e}")
+            st.stop()
 
-        st.caption(
-            f"Preview • Rows: **{len(invoice_df):,}** • Columns: {', '.join(invoice_df.columns[:8])}"
-        )
-        st.dataframe(invoice_df.head(10), use_container_width=True)
+        with st.expander("Preview:", expanded=True):
+            st.write(df.head(10))
+            st.caption(f"Rows: {len(df):,} | Columns: {', '.join(df.columns)}")
 
-    # 2) Pick vendor + supplier-code column
+        supplier_col = choose_supplier_col(df)
+        st.session_state["upload_df"] = df
+        st.session_state["supplier_col"] = supplier_col
+    else:
+        st.session_state.pop("upload_df", None)
+        st.session_state.pop("supplier_col", None)
+
+    st.divider()
+
+    # ----------------------
+    # 3) Map to TOW
+    # ----------------------
     st.header("3) Map to TOW")
 
-    colA, colB = st.columns([1, 2])
-    with colA:
-        vendor_opt = ["ALL"] + vlist
-        pick_vendor = st.selectbox("Vendor", vendor_opt, index=0)
+    vendors = ["ALL"] + get_vendor_list()
+    pick_vendor = st.selectbox("Vendor", vendors, index=0, key="map_vendor")
 
-    supplier_col = ""
-    if invoice_df is not None and not invoice_df.empty:
-        supplier_col = st.selectbox(
-            "Which column contains the SUPPLIER code?",
-            options=list(invoice_df.columns),
-            index=max(0, list(invoice_df.columns).index(guess_supplier_col(list(invoice_df.columns)))),
-        )
+    # Only run mapping if we have upload + a specific vendor chosen
+    if "upload_df" in st.session_state and pick_vendor != "ALL":
+        df_up = st.session_state["upload_df"].copy()
+        supplier_col = st.session_state["supplier_col"]
 
-    # 3) Run mapping
-    if invoice_df is not None and supplier_col:
-        st.button("Run mapping", key="run_mapping")
-        # Normalize invoice supplier column (string)
-        inv = invoice_df.copy()
-        inv[supplier_col] = inv[supplier_col].astype(str).str.strip()
+        # Create a clean supplier_id series
+        df_up["supplier_id"] = df_up[supplier_col].astype(str).str.strip()
 
-        # Build crosswalk view (depending on vendor selection)
-        if pick_vendor == "ALL":
-            cw = pd.read_sql("SELECT tow_code, supplier_id, vendor_id FROM crosswalk", conn)
-        else:
-            cw = pd.read_sql(
-                "SELECT tow_code, supplier_id, vendor_id FROM crosswalk WHERE vendor_id = ?",
-                conn,
-                params=[pick_vendor],
+        if st.button("Run mapping", type="primary", key="run_mapping"):
+            vendor_map = get_vendor_mapping(pick_vendor)
+            merged = df_up.merge(vendor_map, how="left", on="supplier_id")
+            matched = merged[merged["tow_code"].notna()].copy()
+            unmatched = merged[merged["tow_code"].isna()].copy()
+
+            st.success(
+                f"Mapping complete → **matched:** {len(matched):,} • **unmatched:** {len(unmatched):,}"
             )
 
-        # Merge: invoice rows → match by supplier_id and (optional) vendor filter used above
-        merged = inv.merge(
-            cw.rename(columns={"supplier_id": supplier_col}),
-            how="left",
-            on=supplier_col,
-            suffixes=("", "_cw"),
-        )
+            with st.expander("Preview: Matched (first 200 rows)", expanded=False):
+                st.dataframe(matched.head(200), use_container_width=True)
 
-        matched = merged[merged["tow_code"].notna()].copy()
-        unmatched = merged[merged["tow_code"].isna()].copy()
+            with st.expander("Preview: Unmatched (first 200 rows)", expanded=False):
+                st.dataframe(unmatched.head(200), use_container_width=True)
 
-        st.success(f"Mapping complete → matched: **{len(matched):,}** | unmatched: **{len(unmatched):,}**")
+            table_download_button(matched, unmatched, "Download Excel (Matched + Unmatched)")
 
-        with st.expander("Preview: Matched (first 200 rows)", expanded=False):
-            st.dataframe(matched.head(200), use_container_width=True)
-            st.download_button(
-                "Download Matched (Excel)",
-                to_excel_bytes(matched),
-                file_name="matched.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    # ----------------------
+    # Admin tools
+    # ----------------------
+    st.divider()
+    with st.expander("🔐 Admin • Live search / Add mapping (direct upsert)"):
+        col_pin, _ = st.columns([1, 3])
+        with col_pin:
+            pin = st.text_input("Admin PIN", type="password", key="admin_pin")
+            ok = st.button("Unlock", key="unlock_admin")
 
-        with st.expander("Preview: Unmatched (first 200 rows)", expanded=False):
-            st.dataframe(unmatched.head(200), use_container_width=True)
-            st.download_button(
-                "Download Unmatched (Excel)",
-                to_excel_bytes(unmatched),
-                file_name="unmatched.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    # ------------------------- ADMIN -------------------------
-    st.write("---")
-    with st.expander("🔐 Admin • Live search / Add mapping (direct upsert)", expanded=False):
-        pin_col, _ = st.columns([1, 4])
-        with pin_col:
-            pin = st.text_input("Admin PIN", type="password")
-            unlocked = st.button("Unlock")
-
-        if unlocked:
-            st.session_state["admin_unlocked"] = (pin == ADMIN_PIN)
+        if ok and pin == "2468":
+            st.session_state["admin_unlocked"] = True
+        elif ok:
+            st.warning("Wrong PIN")
 
         if st.session_state.get("admin_unlocked"):
             st.success("Admin unlocked.")
 
+            # --- Add single mapping
             st.subheader("Add a single mapping (direct UPSERT to SQLite)")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                vendor_id = st.text_input("vendor_id", value="")
-            with c2:
-                supplier_id = st.text_input("supplier_id", value="")
-            with c3:
-                tow_code = st.text_input("tow_code", value="")
+            with st.form("add_single_form", clear_on_submit=False):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    v = st.text_input("vendor_id", placeholder="e.g. DOB0000025", key="adm_vendor")
+                with c2:
+                    s = st.text_input("supplier_id", placeholder="e.g. 0983656023", key="adm_supplier")
+                with c3:
+                    t = st.text_input("tow_code", placeholder="e.g. 200183", key="adm_tow")
 
-            if st.button("Add (Direct to SQLite)"):
-                ok, msg = upsert_mapping(conn, vendor_id, supplier_id, tow_code)
-                (st.success if ok else st.error)(msg)
+                on_submit = st.form_submit_button("Add (Direct to SQLite)")
+                queue_submit = st.form_submit_button("Add to queue (data/updates.csv)")
 
-            st.write("---")
+            if on_submit and v and s and t:
+                try:
+                    n = upsert_mapping(v, s, t)
+                    st.success(f"Upsert complete (rows affected: {n}).")
+                    # refresh counts
+                    get_db_counts.clear()
+                except Exception as e:
+                    st.error(f"Insert failed: {e}")
+
+            if queue_submit and v and s and t:
+                queue_append(v, s, t)
+                st.success(f"Queued: {v}, {s} → {t}")
+
+            # --- Queue view & actions
+            st.subheader("Queued updates (data/updates.csv)")
+            qdf = queue_read()
+            st.dataframe(qdf, use_container_width=True, height=260)
+
+            cqa, cqb, cqc = st.columns([1, 1, 2])
+            with cqa:
+                if st.button("Apply queued to SQLite (Upsert)"):
+                    okn, badn = queue_apply()
+                    st.success(f"Applied: {okn} • Errors: {badn}")
+                    # Refresh counts
+                    get_db_counts.clear()
+            with cqb:
+                if st.button("Clear queued CSV"):
+                    queue_clear()
+                    st.info("Queue cleared.")
+            with cqc:
+                if not qdf.empty:
+                    out = io.BytesIO()
+                    qdf.to_csv(out, index=False)
+                    st.download_button(
+                        "Download queued CSV",
+                        data=out.getvalue(),
+                        file_name="updates.csv",
+                        mime="text/csv",
+                        key="dl_queue",
+                    )
+
+            # --- Live Search
             st.subheader("Live search / inspect crosswalk")
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                vpick = st.selectbox("Vendor", ["ALL"] + get_vendor_list(), key="live_vendor")
+            with c2:
+                ssub = st.text_input("supplier_id contains ...", key="live_sup_sub")
 
-            vendor_pick = st.selectbox("Vendor", ["ALL"] + vlist)
-            s_like = st.text_input("supplier_id contains …", value="")
-            t_like = st.text_input("tow_code contains …", value="")
-            limit = st.number_input("Rows to show (max 2000)", min_value=50, max_value=2000, value=500, step=50)
-
-            if st.button("Search"):
-                df = live_search(conn, vendor_pick, s_like, t_like, int(limit))
-                st.caption(f"{len(df)} result(s) shown")
-                st.dataframe(df, use_container_width=True)
+            df_live = live_search_crosswalk(vpick, ssub, limit=500)
+            st.caption("0 results shown (max 500)") if df_live.empty else st.caption(
+                f"{len(df_live):,} results (max 500)"
+            )
+            st.dataframe(df_live, use_container_width=True, height=320)
 
         else:
-            st.info("Enter PIN and press Unlock to access admin features.")
-
-    # Footer
-    st.caption(
-        f"DB: **{DB_PATH}**"
-    )
+            st.info("Enter PIN to unlock admin tools. (Default demo PIN: 2468)")
 
 
 if __name__ == "__main__":
