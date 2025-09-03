@@ -8,7 +8,6 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
-from datetime import datetime
 
 st.set_page_config(page_title="Supplier → TOW Mapper (SQLite)", layout="wide")
 
@@ -16,8 +15,6 @@ st.set_page_config(page_title="Supplier → TOW Mapper (SQLite)", layout="wide")
 # Constants & paths
 # =============================================================================
 DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = DATA_DIR / "crosswalk.db"
 CSV_FALLBACK_1 = DATA_DIR / "crosswalk.csv"
 CSV_FALLBACK_2 = Path("crosswalk.csv")
@@ -32,29 +29,30 @@ def _log(msg: str):
     if DEBUG:
         st.caption(f"🔎 {msg}")
 
-def _first_existing_db() -> Path:
-    for p in DB_CANDIDATES:
-        if p.exists():
-            return p
-    # default where we also upload/replace
-    return DB_PATH
 
+# =============================================================================
+from datetime import datetime
+
+st.caption(f"📦 DB path: {DB_PATH.resolve()}")
+if DB_PATH.exists():
+    st.caption(
+        f"🕒 DB modified: {datetime.fromtimestamp(DB_PATH.stat().st_mtime):%Y-%m-%d %H:%M:%S} • "
+        f"size: {DB_PATH.stat().st_size/1_048_576:.2f} MB"
+    )
+    if st.button("Count rows (live from SQLite)"):
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cnt = con.execute("SELECT COUNT(*) FROM crosswalk").fetchone()[0]
+            st.success(f"SQLite says: {cnt:,} rows")
+        finally:
+            con.close()
+else:
+    st.warning("DB not found at expected path; app may be falling back to CSV.")
+
+# Utilities
+# =============================================================================
 def _ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-def get_connection(path: Optional[Path] = None) -> sqlite3.Connection:
-    """
-    Open SQLite with sane performance settings for read-heavy workloads.
-    """
-    target = str((path or _first_existing_db()).resolve())
-    con = sqlite3.connect(target, check_same_thread=False)
-    # Reasonable PRAGMAs (safe for Streamlit cloud)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
-    con.execute("PRAGMA temp_store=MEMORY;")
-    con.execute("PRAGMA mmap_size=134217728;")  # 128MB
-    con.execute("PRAGMA cache_size=-40000;")     # ~40MB
-    return con
 
 def _query_one(con: sqlite3.Connection, sql: str, params: tuple = ()) -> Optional[tuple]:
     cur = con.cursor()
@@ -77,31 +75,11 @@ def _detect_crosswalk_columns(con: sqlite3.Connection) -> dict:
 
     if not tow_col or not supplier_col:
         raise ValueError(
-            f"crosswalk must have tow/tow_code AND supplier_id/supplier_code. Found: {list(cols.keys())}"
+            f"Crosswalk table must have tow/tow_code AND supplier_id/supplier_code. "
+            f"Found: {list(cols.keys())}"
         )
     return {"supplier": supplier_col, "tow": tow_col, "vendor": vendor_col}
 
-# =============================================================================
-# Header diagnostics
-# =============================================================================
-db_probe = _first_existing_db()
-st.caption(f"📦 DB path (active): {db_probe.resolve()}")
-if db_probe.exists():
-    st.caption(
-        f"🕒 DB modified: {datetime.fromtimestamp(db_probe.stat().st_mtime):%Y-%m-%d %H:%M:%S} • "
-        f"size: {db_probe.stat().st_size/1_048_576:.2f} MB"
-    )
-    if st.button("Count rows (live from SQLite)"):
-        con = get_connection(db_probe)
-        try:
-            cnt = con.execute("SELECT COUNT(*) FROM crosswalk").fetchone()[0]
-            st.success(f"SQLite says: {cnt:,} rows")
-        except Exception as e:
-            st.error(f"Count failed: {e}")
-        finally:
-            con.close()
-else:
-    st.warning("DB not found at expected path(s); app may be falling back to CSV.")
 
 # =============================================================================
 # Crosswalk loaders (DB preferred, CSV fallback)
@@ -110,13 +88,13 @@ else:
 def load_crosswalk_standardized() -> pd.DataFrame:
     """
     Open a crosswalk SQLite DB and return a DataFrame with canonical columns:
-      - supplier_id (normalized)
-      - tow         (normalized)
+      - supplier_id (normalized from supplier_id/supplier_code)
+      - tow         (normalized from tow/tow_code)
       - vendor_id   (optional)
     """
     for p in DB_CANDIDATES:
         if p.exists():
-            con = get_connection(p)
+            con = sqlite3.connect(str(p))
             try:
                 cols = _detect_crosswalk_columns(con)
                 supplier, tow = cols["supplier"], cols["tow"]
@@ -140,6 +118,7 @@ def load_crosswalk_standardized() -> pd.DataFrame:
             return df
 
     raise FileNotFoundError("No crosswalk DB found (data/crosswalk.db or ./crosswalk.db).")
+
 
 @st.cache_data(show_spinner=False)
 def load_crosswalk_from_csv() -> pd.DataFrame:
@@ -187,6 +166,7 @@ def load_crosswalk_from_csv() -> pd.DataFrame:
             return out
 
     raise FileNotFoundError("No crosswalk CSV found (data/crosswalk.csv or crosswalk.csv).")
+
 
 # =============================================================================
 # UI: Help + Cache control
@@ -246,10 +226,8 @@ invoice_df = None
 if invoice_file:
     try:
         if invoice_file.name.lower().endswith((".xlsx", ".xls")):
-            # Preserve leading zeros explicitly
-            invoice_df = pd.read_excel(
-                invoice_file, engine="openpyxl", dtype=str
-            )
+            # openpyxl is commonly present via streamlit requirements
+            invoice_df = pd.read_excel(invoice_file, engine="openpyxl")
         else:
             invoice_df = pd.read_csv(
                 invoice_file, engine="python", dtype=str, encoding="utf-8", on_bad_lines="skip"
@@ -335,6 +313,7 @@ else:
 # =============================================================================
 def _ensure_unique_index(con: sqlite3.Connection, supplier_col: str, vendor_col: Optional[str]):
     if not vendor_col:
+        # If the DB has no vendor_id, index only supplier (best-effort)
         con.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS ix_crosswalk_supplier ON crosswalk("{supplier_col}")')
     else:
         con.execute(
@@ -343,37 +322,29 @@ def _ensure_unique_index(con: sqlite3.Connection, supplier_col: str, vendor_col:
         )
     con.commit()
 
-def _normalize_ids(vendor_id: str, supplier_id: str) -> tuple[str, str]:
-    v = ("" if vendor_id is None else str(vendor_id)).strip().upper()
-    s = ("" if supplier_id is None else str(supplier_id)).strip().upper()
-    return v, s
-
 def upsert_mapping_sqlite(vendor_id: str, supplier_id: str, tow_code: str) -> None:
     """Insert/update one mapping in SQLite, resolving real column names."""
     _ensure_data_dir()
-    dbp = _first_existing_db()
-    con = get_connection(dbp if dbp.exists() else DB_PATH)
+    con = sqlite3.connect(DB_PATH)
     try:
         cols = _detect_crosswalk_columns(con)
         supplier_col, tow_col, vendor_col = cols["supplier"], cols["tow"], cols["vendor"]
         _ensure_unique_index(con, supplier_col, vendor_col)
 
-        # Normalize like loader (prevents case/space mismatches)
-        ven_norm, sup_norm = _normalize_ids(vendor_id, supplier_id)
-        tow_norm = str(tow_code).strip()
-
+        # Build SQL with actual column names
         if vendor_col:
             sql = (
                 f'INSERT INTO crosswalk("{tow_col}", "{supplier_col}", "{vendor_col}") VALUES (?,?,?) '
                 f'ON CONFLICT("{vendor_col}", "{supplier_col}") DO UPDATE SET "{tow_col}" = excluded."{tow_col}"'
             )
-            params = (tow_norm, sup_norm, ven_norm)
+            params = (str(tow_code).strip(), str(supplier_id).strip(), str(vendor_id).strip())
         else:
+            # No vendor column in DB: conflict only on supplier_id
             sql = (
                 f'INSERT INTO crosswalk("{tow_col}", "{supplier_col}") VALUES (?,?) '
                 f'ON CONFLICT("{supplier_col}") DO UPDATE SET "{tow_col}" = excluded."{tow_col}"'
             )
-            params = (tow_norm, sup_norm)
+            params = (str(tow_code).strip(), str(supplier_id).strip())
 
         con.execute(sql, params)
         con.commit()
@@ -384,23 +355,21 @@ def append_pending_csv(vendor_id: str, supplier_id: str, tow_code: str) -> None:
     """Queue mapping into data/updates.csv (create file if missing)."""
     _ensure_data_dir()
     write_header = not PENDING_CSV.exists()
-    ven_norm, sup_norm = _normalize_ids(vendor_id, supplier_id)
     with PENDING_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["tow_code", "supplier_id", "vendor_id"])
         if write_header:
             w.writeheader()
         w.writerow({
             "tow_code": str(tow_code).strip(),
-            "supplier_id": sup_norm,
-            "vendor_id": ven_norm
+            "supplier_id": str(supplier_id).strip(),
+            "vendor_id": str(vendor_id).strip()
         })
 
 def apply_pending_to_sqlite() -> int:
     """Read data/updates.csv and upsert all rows; return count."""
     if not PENDING_CSV.exists():
         return 0
-    dbp = _first_existing_db()
-    con = get_connection(dbp if dbp.exists() else DB_PATH)
+    con = sqlite3.connect(DB_PATH)
     try:
         cols = _detect_crosswalk_columns(con)
         supplier_col, tow_col, vendor_col = cols["supplier"], cols["tow"], cols["vendor"]
@@ -411,8 +380,8 @@ def apply_pending_to_sqlite() -> int:
             rdr = csv.DictReader(f)
             for r in rdr:
                 tow = str(r["tow_code"]).strip()
-                sup = (str(r["supplier_id"]) if r.get("supplier_id") is not None else "").strip().upper()
-                ven = (str(r.get("vendor_id", "")) if r.get("vendor_id") is not None else "").strip().upper()
+                sup = str(r["supplier_id"]).strip()
+                ven = str(r.get("vendor_id", "")).strip()
 
                 if vendor_col:
                     sql = (
@@ -440,6 +409,7 @@ def load_pending_df():
         return pd.read_csv(PENDING_CSV, dtype=str)
     return pd.DataFrame(columns=["tow_code", "supplier_id", "vendor_id"])
 
+
 # =============================================================================
 # Admin panel (PIN-gated)
 # =============================================================================
@@ -458,7 +428,7 @@ with st.expander("🔐 Admin • Add / Queue / Apply Mappings", expanded=False):
         else:
             st.success("Admin unlocked.")
             st.session_state["admin_pin_ok"] = True
-            st.caption(f"DB: `{_first_existing_db()}`  •  Pending CSV: `{PENDING_CSV}`")
+            st.caption(f"DB: `{DB_PATH}`  •  Pending CSV: `{PENDING_CSV}`")
 
     if st.session_state.get("admin_pin_ok"):
         st.subheader("Add a single mapping")
@@ -525,59 +495,32 @@ with st.expander("🔐 Admin • Add / Queue / Apply Mappings", expanded=False):
                 except Exception as e:
                     st.exception(e)
 
-        st.subheader("DB maintenance")
-        colM1, colM2 = st.columns([1,1])
-        with colM1:
-            if st.button("VACUUM / REINDEX"):
-                try:
-                    con = get_connection()
-                    with con:
-                        con.execute("PRAGMA optimize;")
-                        con.execute("REINDEX;")
-                        con.execute("VACUUM;")
-                    st.success("Done.")
-                except Exception as e:
-                    st.exception(e)
-                finally:
-                    con.close()
-
-        with colM2:
-            uploaded_db = st.file_uploader(
-                "Replace data/crosswalk.db (upload a .db file)", type=["db"], key="db_upl")
-            if uploaded_db is not None:
-                outp = DB_PATH  # always replace in /data
-                outp.write_bytes(uploaded_db.getvalue())
-                st.success(f"Replaced DB at {outp}.")
-                st.info("Click ♻️ Clear cache & re-run (top) to reload the new DB.")
 
 # =============================================================================
 # Admin: Live search / inspect crosswalk
 # =============================================================================
 def _list_vendors():
-    dbp = _first_existing_db()
-    if not dbp.exists():
+    if not DB_PATH.exists():
         return []
-    con = get_connection(dbp)
+    con = sqlite3.connect(DB_PATH)
     try:
-        rows = con.execute("SELECT DISTINCT vendor_id FROM crosswalk WHERE vendor_id IS NOT NULL AND TRIM(vendor_id) <> '' ORDER BY vendor_id").fetchall()
-        return [r[0] for r in rows]
+        rows = con.execute("SELECT DISTINCT vendor_id FROM crosswalk ORDER BY vendor_id").fetchall()
+        return [r[0] for r in rows if r[0] is not None and str(r[0]).strip()]
     except Exception:
         return []
     finally:
         con.close()
 
 def _search_mappings(vendor_filter: str | None, supplier_q: str, exact: bool) -> pd.DataFrame:
-    dbp = _first_existing_db()
-    if not dbp.exists():
+    if not DB_PATH.exists():
         return pd.DataFrame(columns=["vendor_id", "supplier_id", "tow_code"])
-    con = get_connection(dbp)
+    con = sqlite3.connect(DB_PATH)
     try:
+        # Detect actual col names to build a consistent SELECT
         cols = _detect_crosswalk_columns(con)
         supplier_col, tow_col, vendor_col = cols["supplier"], cols["tow"], cols["vendor"]
 
-        select = f'SELECT "{supplier_col}" AS supplier_id, "{tow_col}" AS tow_code'
-        if vendor_col:
-            select = f'SELECT "{vendor_col}" AS vendor_id, "{supplier_col}" AS supplier_id, "{tow_col}" AS tow_code'
+        select = f'SELECT {f""""{vendor_col}", """ if vendor_col else ""}"{supplier_col}" AS supplier_id, "{tow_col}" AS tow_code FROM crosswalk'
         clauses, params = [], []
 
         if vendor_col and vendor_filter and vendor_filter != "ALL":
@@ -594,10 +537,7 @@ def _search_mappings(vendor_filter: str | None, supplier_q: str, exact: bool) ->
 
         if clauses:
             select += " WHERE " + " AND ".join(clauses)
-        if vendor_col:
-            select += f' ORDER BY "{vendor_col}", "{supplier_col}" LIMIT 500'
-        else:
-            select += f' ORDER BY "{supplier_col}" LIMIT 500'
+        select += f' ORDER BY {f""""{vendor_col}", """ if vendor_col else ""}"{supplier_col}" LIMIT 500'
 
         return pd.read_sql_query(select, con, params=params, dtype=str)
     finally:
@@ -631,3 +571,12 @@ with st.expander("🔎 Admin • Live search / inspect crosswalk", expanded=Fals
                     st.session_state["prefill_supplier_id"] = str(row.get("supplier_id", "") or "")
                     st.session_state["prefill_tow_code"] = str(row.get("tow_code", "") or "")
                     st.success("Prefilled. Scroll up to 'Add a single mapping' in Admin panel.")
+         
+        st.subheader("DB maintenance")
+uploaded_db = st.file_uploader("Replace data/crosswalk.db (upload a .db file)", type=["db"], key="db_upl")
+if uploaded_db is not None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    outp = DATA_DIR / "crosswalk.db"
+    outp.write_bytes(uploaded_db.getvalue())
+    st.success(f"Replaced DB at {outp}.")
+    st.info("Click ♻️ Clear cache & re-run (top) to reload the new DB.")
