@@ -29,7 +29,7 @@ def detect_sep_and_skip(path: Path, enc: str = "utf-8") -> Tuple[str, int]:
     """Detect separator (comma/semicolon) and whether first line is 'sep=;'."""
     head = path.read_bytes()[:4096].decode(enc, errors="ignore")
     first = (head.splitlines() or [""])[0].strip().lower()
-    sep = ";" if first.count(";") > first.count(",") else ","
+    sep = ";" if first.count(";") > first.count(", ") else ", "
     skip = 1 if first.startswith("sep=") else 0
     return sep, skip
 
@@ -82,7 +82,7 @@ def pick_columns(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
     """
     # build lowercase->original map
     low_map = {c.strip().lower(): c for c in df.columns}
-    rev = {k: v for v, k in low_map.items()}  # original->lower (not used, kept for clarity)
+    # rev = {k: v for v, k in low_map.items()}  # original->lower (unused)
 
     def pick(cands) -> Optional[str]:
         for c in cands:
@@ -219,7 +219,7 @@ def build_from_csv(csv_path: Path, db_path: Path, chunksize: int, rebuild: bool)
     finally:
         con.close()
 
-    print(f"✓ Done. Total upserted rows: {total_rows:,} into {db_path}")
+    print(f"✓ Done. Total upserted rows: {total_rows:, } into {db_path}")
 
 
 # ----------------------------
